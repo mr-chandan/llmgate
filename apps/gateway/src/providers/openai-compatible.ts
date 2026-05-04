@@ -1,6 +1,7 @@
 import OpenAI from "openai";
 import { randomUUID } from "node:crypto";
 import type {
+  ChatCompletionChunk,
   ChatCompletionRequest,
   ChatCompletionResponse,
   Provider,
@@ -75,6 +76,38 @@ export function createOpenAICompatibleProvider(
           total_tokens: response.usage?.total_tokens ?? 0,
         },
       };
+    },
+
+    async *chatStream(req): AsyncIterable<ChatCompletionChunk> {
+      const fallbackId = `chatcmpl-${randomUUID()}`;
+      const fallbackCreated = Math.floor(Date.now() / 1000);
+
+      const stream = await client.chat.completions.create({
+        model: req.model,
+        messages: req.messages,
+        temperature: req.temperature,
+        max_tokens: req.max_tokens,
+        stream: true,
+      });
+
+      for await (const chunk of stream) {
+        yield {
+          id: chunk.id ?? fallbackId,
+          object: "chat.completion.chunk",
+          created: chunk.created ?? fallbackCreated,
+          model: chunk.model ?? req.model,
+          choices: chunk.choices.map((c) => ({
+            index: c.index,
+            delta: {
+              ...(c.delta.role === "assistant" && {
+                role: "assistant" as const,
+              }),
+              ...(c.delta.content != null && { content: c.delta.content }),
+            },
+            finish_reason: c.finish_reason ?? null,
+          })),
+        };
+      }
     },
   };
 }

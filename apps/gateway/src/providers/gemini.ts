@@ -2,6 +2,7 @@ import { GoogleGenAI } from "@google/genai";
 import { randomUUID } from "node:crypto";
 import { config } from "../config.js";
 import type {
+  ChatCompletionChunk,
   ChatCompletionRequest,
   ChatCompletionResponse,
   Provider,
@@ -88,6 +89,66 @@ export const geminiProvider: Provider = {
         completion_tokens: usage?.candidatesTokenCount ?? 0,
         total_tokens: usage?.totalTokenCount ?? 0,
       },
+    };
+  },
+
+  async *chatStream(req): AsyncIterable<ChatCompletionChunk> {
+    const { systemInstruction, contents } = toGeminiContents(req.messages);
+    const id = `chatcmpl-${randomUUID()}`;
+    const created = Math.floor(Date.now() / 1000);
+
+    const stream = await client.models.generateContentStream({
+      model: req.model,
+      contents,
+      config: {
+        systemInstruction,
+        temperature: req.temperature,
+        maxOutputTokens: req.max_tokens,
+      },
+    });
+
+    let firstChunk = true;
+    let finishReason: string | null = null;
+
+    for await (const chunk of stream) {
+      const text = chunk.text ?? "";
+      const candidate = chunk.candidates?.[0];
+      if (candidate?.finishReason) {
+        finishReason = mapFinishReason(candidate.finishReason);
+      }
+
+      if (text) {
+        yield {
+          id,
+          object: "chat.completion.chunk",
+          created,
+          model: req.model,
+          choices: [
+            {
+              index: 0,
+              delta: firstChunk
+                ? { role: "assistant", content: text }
+                : { content: text },
+              finish_reason: null,
+            },
+          ],
+        };
+        firstChunk = false;
+      }
+    }
+
+    yield {
+      id,
+      object: "chat.completion.chunk",
+      created,
+      model: req.model,
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: finishReason ?? "stop",
+        },
+      ],
     };
   },
 };

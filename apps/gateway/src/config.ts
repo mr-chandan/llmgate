@@ -12,6 +12,7 @@ const ConfigSchema = z.object({
         .default("info"),
     GEMINI_API_KEY: z.string().min(1, "GEMINI_API_KEY is required"),
     GROQ_API_KEY: z.string().min(1).optional(),
+    DATABASE_URL: z.string().default("./dev.sqlite"),
 });
 
 const parsed = ConfigSchema.safeParse(process.env);

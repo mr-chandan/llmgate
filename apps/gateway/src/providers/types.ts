@@ -28,8 +28,21 @@ export interface ChatCompletionResponse {
   };
 }
 
+export interface ChatCompletionChunk {
+  id: string;
+  object: "chat.completion.chunk";
+  created: number;
+  model: string;
+  choices: Array<{
+    index: number;
+    delta: { role?: "assistant"; content?: string };
+    finish_reason: string | null;
+  }>;
+}
+
 export interface Provider {
   id: string;
   supports(model: string): boolean;
   chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse>;
+  chatStream(req: ChatCompletionRequest): AsyncIterable<ChatCompletionChunk>;
 }

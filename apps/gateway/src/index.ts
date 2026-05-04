@@ -1,12 +1,18 @@
-import Fastify from "fastify";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { config } from "./config.js";
+import { runMigrations } from "./db/client.js";
 import {
   listProviders,
   pickProviderById,
 } from "./providers/registry.js";
+import type {
+  ChatCompletionChunk,
+  ChatCompletionRequest,
+  Provider,
+} from "./providers/types.js";
 import { MODEL_REGISTRY } from "./routing/registry.js";
-import { resolveCandidates } from "./routing/policy.js";
+import { resolveCandidates, type RoutingCandidate } from "./routing/policy.js";
 
 const app = Fastify({
   logger: { level: config.LOG_LEVEL },
@@ -80,6 +86,19 @@ app.post("/v1/chat/completions", async (request, reply) => {
     });
   }
 
+  if (parsed.data.stream === true) {
+    return handleStreaming(request, reply, parsed.data, candidates);
+  }
+
+  return handleNonStreaming(request, reply, parsed.data, candidates);
+});
+
+async function handleNonStreaming(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  req: ChatCompletionRequest,
+  candidates: RoutingCandidate[]
+) {
   const attempts: Array<{ provider: string; model: string; error: string }> =
     [];
 
@@ -89,14 +108,14 @@ app.post("/v1/chat/completions", async (request, reply) => {
       attempts.push({
         provider: candidate.providerId,
         model: candidate.modelId,
-        error: "provider not registered (missing API key?)",
+        error: "provider not registered",
       });
       continue;
     }
 
     try {
       const response = await provider.chat({
-        ...parsed.data,
+        ...req,
         model: candidate.modelId,
       });
 
@@ -126,11 +145,153 @@ app.post("/v1/chat/completions", async (request, reply) => {
       attempts,
     },
   });
-});
+}
+
+async function handleStreaming(
+  request: FastifyRequest,
+  reply: FastifyReply,
+  req: ChatCompletionRequest,
+  candidates: RoutingCandidate[]
+) {
+  const attempts: Array<{ provider: string; model: string; error: string }> =
+    [];
+
+  for (const candidate of candidates) {
+    const provider = pickProviderById(candidate.providerId);
+    if (!provider) {
+      attempts.push({
+        provider: candidate.providerId,
+        model: candidate.modelId,
+        error: "provider not registered",
+      });
+      continue;
+    }
+
+    const probeResult = await probeStream(provider, {
+      ...req,
+      model: candidate.modelId,
+    });
+
+    if ("error" in probeResult) {
+      request.log.warn(
+        {
+          provider: provider.id,
+          model: candidate.modelId,
+          err: probeResult.error,
+        },
+        "Stream failed before first chunk; trying next candidate"
+      );
+      attempts.push({
+        provider: provider.id,
+        model: candidate.modelId,
+        error: probeResult.error,
+      });
+      continue;
+    }
+
+    reply.hijack();
+    const res = reply.raw;
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache, no-transform",
+      Connection: "keep-alive",
+      "x-llmgate-provider": provider.id,
+      "x-llmgate-model": candidate.modelId,
+      "x-llmgate-attempts": String(attempts.length + 1),
+    });
+
+    const writeChunk = (chunk: ChatCompletionChunk) => {
+      res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+    };
+
+    request.raw.on("close", () => {
+      if (!res.writableEnded) {
+        request.log.info("Client disconnected mid-stream");
+      }
+    });
+
+    try {
+      writeChunk(probeResult.first);
+      for await (const chunk of probeResult.rest) {
+        writeChunk(chunk);
+      }
+      res.write("data: [DONE]\n\n");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "unknown error";
+      request.log.error(
+        { provider: provider.id, model: candidate.modelId, err: message },
+        "Stream errored mid-flight"
+      );
+      const errChunk: ChatCompletionChunk = {
+        id: probeResult.first.id,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model: candidate.modelId,
+        choices: [
+          {
+            index: 0,
+            delta: {},
+            finish_reason: "upstream_disconnect",
+          },
+        ],
+      };
+      writeChunk(errChunk);
+      res.write("data: [DONE]\n\n");
+    }
+
+    res.end();
+    return;
+  }
+
+  return reply.code(502).send({
+    error: {
+      type: "all_providers_failed",
+      message: "All streaming candidates failed before first chunk",
+      attempts,
+    },
+  });
+}
+
+async function probeStream(
+  provider: Provider,
+  req: ChatCompletionRequest
+): Promise<
+  | { first: ChatCompletionChunk; rest: AsyncIterable<ChatCompletionChunk> }
+  | { error: string }
+> {
+  try {
+    const iterable = provider.chatStream(req);
+    const iterator = iterable[Symbol.asyncIterator]();
+    const firstResult = await iterator.next();
+
+    if (firstResult.done || !firstResult.value) {
+      return { error: "stream ended with no chunks" };
+    }
+
+    const rest: AsyncIterable<ChatCompletionChunk> = {
+      [Symbol.asyncIterator]() {
+        return {
+          async next() {
+            return iterator.next();
+          },
+        };
+      },
+    };
+
+    return { first: firstResult.value, rest };
+  } catch (err) {
+    return {
+      error: err instanceof Error ? err.message : "unknown error",
+    };
+  }
+}
 
 try {
+  runMigrations();
+  app.log.info("Migrations applied");
   await app.listen({ port: config.PORT, host: config.HOST });
 } catch (err) {
   app.log.error(err);
   process.exit(1);
 }
+
