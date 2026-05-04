@@ -1,0 +1,21 @@
+{
+  "name": "llmgate",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Open-source multi-tenant LLM gateway. Bring your own keys.",
+  "license": "MIT",
+  "packageManager": "pnpm@10.32.1",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @llmgate/gateway dev",
+    "build": "pnpm -r build",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.3"
+  }
+}

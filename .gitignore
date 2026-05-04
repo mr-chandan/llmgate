@@ -1,0 +1,34 @@
+# Dependencies — these are huge and can be reinstalled from package.json
+node_modules/
+
+# Build output — generated from source code, no point versioning it
+dist/
+build/
+*.tsbuildinfo
+
+# Environment files — these contain SECRETS like API keys. Never commit these.
+.env
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+pnpm-debug.log*
+
+# Editor and OS junk
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+
+# Database files (we'll use SQLite for dev)
+*.sqlite
+*.sqlite-journal
+*.db
+
+# Cache
+.turbo/
+.cache/
