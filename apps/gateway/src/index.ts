@@ -1,8 +1,12 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
+import { and, count, eq, gte, lte, sum } from "drizzle-orm";
 import { z } from "zod";
-import { config } from "./config.js";
-import { runMigrations } from "./db/client.js";
 import { applyAuth } from "./auth.js";
+import { config } from "./config.js";
+import { db } from "./db/client.js";
+import { runMigrations } from "./db/client.js";
+import { recordRequestLog } from "./db/logger.js";
+import { requestLogs } from "./db/schema.js";
 import {
   listProviders,
   pickProviderById,
@@ -14,6 +18,8 @@ import type {
 } from "./providers/types.js";
 import { MODEL_REGISTRY } from "./routing/registry.js";
 import { resolveCandidates, type RoutingCandidate } from "./routing/policy.js";
+import { checkBudget } from "./limits/budget.js";
+import { checkRateLimit } from "./limits/rate.js";
 
 const app = Fastify({
   logger: { level: config.LOG_LEVEL },
@@ -66,6 +72,79 @@ app.get("/v1/models", async () => {
   };
 });
 
+app.get("/v1/usage", async (request) => {
+  const tenantId = request.tenant!.id;
+  const query = request.query as { from?: string; to?: string };
+
+  const conditions = [eq(requestLogs.tenantId, tenantId)];
+  if (query.from) {
+    const d = new Date(query.from);
+    if (!Number.isNaN(d.getTime())) conditions.push(gte(requestLogs.createdAt, d));
+  }
+  if (query.to) {
+    const d = new Date(query.to);
+    if (!Number.isNaN(d.getTime())) conditions.push(lte(requestLogs.createdAt, d));
+  }
+  const where = conditions.length > 1 ? and(...conditions) : conditions[0];
+
+  const rows = db
+    .select({
+      model: requestLogs.resolvedModel,
+      requests: count(),
+      promptTokens: sum(requestLogs.promptTokens),
+      completionTokens: sum(requestLogs.completionTokens),
+      totalTokens: sum(requestLogs.totalTokens),
+      costUsd: sum(requestLogs.costUsd),
+    })
+    .from(requestLogs)
+    .where(where)
+    .groupBy(requestLogs.resolvedModel)
+    .all();
+
+  const totals = rows.reduce(
+    (acc, r) => ({
+      requests: acc.requests + Number(r.requests ?? 0),
+      promptTokens: acc.promptTokens + Number(r.promptTokens ?? 0),
+      completionTokens:
+        acc.completionTokens + Number(r.completionTokens ?? 0),
+      totalTokens: acc.totalTokens + Number(r.totalTokens ?? 0),
+      costUsd: acc.costUsd + Number(r.costUsd ?? 0),
+    }),
+    {
+      requests: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      costUsd: 0,
+    }
+  );
+
+  return {
+    tenant_id: tenantId,
+    from: query.from ?? null,
+    to: query.to ?? null,
+    totals: {
+      requests: totals.requests,
+      tokens: {
+        prompt: totals.promptTokens,
+        completion: totals.completionTokens,
+        total: totals.totalTokens,
+      },
+      cost_usd: Number(totals.costUsd.toFixed(6)),
+    },
+    by_model: rows.map((r) => ({
+      model: r.model,
+      requests: Number(r.requests ?? 0),
+      tokens: {
+        prompt: Number(r.promptTokens ?? 0),
+        completion: Number(r.completionTokens ?? 0),
+        total: Number(r.totalTokens ?? 0),
+      },
+      cost_usd: Number(Number(r.costUsd ?? 0).toFixed(6)),
+    })),
+  };
+});
+
 app.post("/v1/chat/completions", async (request, reply) => {
   const parsed = ChatCompletionRequestSchema.safeParse(request.body);
 
@@ -75,6 +154,39 @@ app.post("/v1/chat/completions", async (request, reply) => {
         type: "invalid_request_error",
         message: "Request body validation failed",
         details: parsed.error.format(),
+      },
+    });
+  }
+
+  const tenantId = request.tenant!.id;
+
+  const rate = checkRateLimit(tenantId);
+  if (!rate.ok) {
+    reply.header("Retry-After", String(rate.retryAfterSec));
+    reply.header("x-ratelimit-limit", String(rate.limit));
+    reply.header("x-ratelimit-remaining", "0");
+    return reply.code(429).send({
+      error: {
+        type: "rate_limit_exceeded",
+        message: `Rate limit exceeded: ${rate.limit} req/min`,
+        retry_after_seconds: rate.retryAfterSec,
+      },
+    });
+  }
+  if (rate.limit != null) {
+    reply.header("x-ratelimit-limit", String(rate.limit));
+    reply.header("x-ratelimit-remaining", String(rate.remaining));
+  }
+
+  const budget = checkBudget(tenantId);
+  if (!budget.ok) {
+    return reply.code(402).send({
+      error: {
+        type: "budget_exceeded",
+        message: budget.reason,
+        spent_usd: Number((budget.spentUsd ?? 0).toFixed(6)),
+        cap_usd: budget.capUsd,
+        period: budget.period,
       },
     });
   }
@@ -96,12 +208,16 @@ app.post("/v1/chat/completions", async (request, reply) => {
   return handleNonStreaming(request, reply, parsed.data, candidates);
 });
 
+
 async function handleNonStreaming(
   request: FastifyRequest,
   reply: FastifyReply,
   req: ChatCompletionRequest,
   candidates: RoutingCandidate[]
 ) {
+  const startedAt = Date.now();
+  const tenantId = request.tenant!.id;
+  const apiKeyId = request.apiKeyId ?? null;
   const attempts: Array<{ provider: string; model: string; error: string }> =
     [];
 
@@ -126,6 +242,21 @@ async function handleNonStreaming(
       reply.header("x-llmgate-model", candidate.modelId);
       reply.header("x-llmgate-attempts", String(attempts.length + 1));
 
+      recordRequestLog({
+        tenantId,
+        apiKeyId,
+        providerId: provider.id,
+        requestedModel: req.model,
+        resolvedModel: candidate.modelId,
+        status: 200,
+        promptTokens: response.usage.prompt_tokens,
+        completionTokens: response.usage.completion_tokens,
+        totalTokens: response.usage.total_tokens,
+        latencyMs: Date.now() - startedAt,
+        attempts: attempts.length + 1,
+        streamed: false,
+      });
+
       return response;
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown error";
@@ -140,6 +271,17 @@ async function handleNonStreaming(
       });
     }
   }
+
+  recordRequestLog({
+    tenantId,
+    apiKeyId,
+    requestedModel: req.model,
+    status: 502,
+    latencyMs: Date.now() - startedAt,
+    attempts: attempts.length,
+    streamed: false,
+    errorMessage: "all providers failed",
+  });
 
   return reply.code(502).send({
     error: {
@@ -156,6 +298,9 @@ async function handleStreaming(
   req: ChatCompletionRequest,
   candidates: RoutingCandidate[]
 ) {
+  const startedAt = Date.now();
+  const tenantId = request.tenant!.id;
+  const apiKeyId = request.apiKeyId ?? null;
   const attempts: Array<{ provider: string; model: string; error: string }> =
     [];
 
@@ -192,6 +337,8 @@ async function handleStreaming(
       continue;
     }
 
+    const ttfbMs = Date.now() - startedAt;
+
     reply.hijack();
     const res = reply.raw;
     res.writeHead(200, {
@@ -207,11 +354,7 @@ async function handleStreaming(
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
     };
 
-    request.raw.on("close", () => {
-      if (!res.writableEnded) {
-        request.log.info("Client disconnected mid-stream");
-      }
-    });
+    let errorMessage: string | null = null;
 
     try {
       writeChunk(probeResult.first);
@@ -220,31 +363,52 @@ async function handleStreaming(
       }
       res.write("data: [DONE]\n\n");
     } catch (err) {
-      const message = err instanceof Error ? err.message : "unknown error";
+      errorMessage = err instanceof Error ? err.message : "unknown error";
       request.log.error(
-        { provider: provider.id, model: candidate.modelId, err: message },
+        { provider: provider.id, model: candidate.modelId, err: errorMessage },
         "Stream errored mid-flight"
       );
-      const errChunk: ChatCompletionChunk = {
+      writeChunk({
         id: probeResult.first.id,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model: candidate.modelId,
         choices: [
-          {
-            index: 0,
-            delta: {},
-            finish_reason: "upstream_disconnect",
-          },
+          { index: 0, delta: {}, finish_reason: "upstream_disconnect" },
         ],
-      };
-      writeChunk(errChunk);
+      });
       res.write("data: [DONE]\n\n");
     }
 
     res.end();
+
+    recordRequestLog({
+      tenantId,
+      apiKeyId,
+      providerId: provider.id,
+      requestedModel: req.model,
+      resolvedModel: candidate.modelId,
+      status: errorMessage ? 200 : 200,
+      latencyMs: Date.now() - startedAt,
+      ttfbMs,
+      attempts: attempts.length + 1,
+      streamed: true,
+      errorMessage,
+    });
+
     return;
   }
+
+  recordRequestLog({
+    tenantId,
+    apiKeyId,
+    requestedModel: req.model,
+    status: 502,
+    latencyMs: Date.now() - startedAt,
+    attempts: attempts.length,
+    streamed: true,
+    errorMessage: "all streaming candidates failed before first chunk",
+  });
 
   return reply.code(502).send({
     error: {
@@ -297,4 +461,3 @@ try {
   app.log.error(err);
   process.exit(1);
 }
-

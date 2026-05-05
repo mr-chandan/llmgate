@@ -56,3 +56,17 @@ export function findModelsByClass(className: string): ModelInfo[] {
 export function totalCostScore(m: ModelInfo): number {
   return m.inputUsdPerMTokens + m.outputUsdPerMTokens;
 }
+
+
+export function computeCost(
+  modelId: string,
+  promptTokens: number,
+  completionTokens: number
+): number {
+  const model = findModel(modelId);
+  if (!model) return 0;
+  return (
+    (promptTokens / 1_000_000) * model.inputUsdPerMTokens +
+    (completionTokens / 1_000_000) * model.outputUsdPerMTokens
+  );
+}
