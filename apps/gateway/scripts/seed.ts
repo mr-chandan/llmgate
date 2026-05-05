@@ -18,7 +18,7 @@ const keyId = makeId("key");
 const key = makeApiKey();
 const tenantName = process.argv[2] ?? `tenant-${randomBytes(3).toString("hex")}`;
 
-db.insert(tenants)
+(db as any).insert(tenants)
   .values({
     id: tenantId,
     name: tenantName,
@@ -26,7 +26,7 @@ db.insert(tenants)
   })
   .run();
 
-db.insert(apiKeys)
+(db as any).insert(apiKeys)
   .values({
     id: keyId,
     tenantId,
