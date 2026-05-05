@@ -2,6 +2,7 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { config } from "./config.js";
 import { runMigrations } from "./db/client.js";
+import { applyAuth } from "./auth.js";
 import {
   listProviders,
   pickProviderById,
@@ -17,6 +18,8 @@ import { resolveCandidates, type RoutingCandidate } from "./routing/policy.js";
 const app = Fastify({
   logger: { level: config.LOG_LEVEL },
 });
+
+applyAuth(app);
 
 const ChatCompletionRequestSchema = z.object({
   model: z.string().min(1),
