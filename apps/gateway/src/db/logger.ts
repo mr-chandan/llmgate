@@ -18,6 +18,7 @@ export interface RequestLogParams {
   attempts: number;
   streamed: boolean;
   errorMessage?: string | null;
+  cacheHit?: boolean;
 }
 
 export function recordRequestLog(p: RequestLogParams): void {
@@ -45,6 +46,7 @@ export function recordRequestLog(p: RequestLogParams): void {
       ttfbMs: p.ttfbMs ?? null,
       attempts: p.attempts,
       streamed: p.streamed,
+      cacheHit: p.cacheHit ?? false,
       errorMessage: p.errorMessage ?? null,
     })
     .run();

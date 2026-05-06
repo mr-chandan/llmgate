@@ -1,0 +1,1 @@
+ALTER TABLE `request_logs` ADD `cache_hit` integer DEFAULT false NOT NULL;

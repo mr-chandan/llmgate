@@ -2,11 +2,19 @@ import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { and, count, eq, gte, lte, sum } from "drizzle-orm";
 import { z } from "zod";
 import { applyAuth } from "./auth.js";
+import { cache } from "./cache/memory.js";
+import {
+  buildCacheKey,
+  parseCacheDirective,
+  shouldCache,
+  type CacheDirective,
+} from "./cache/key.js";
 import { config } from "./config.js";
-import { db } from "./db/client.js";
-import { runMigrations } from "./db/client.js";
+import { db, runMigrations } from "./db/client.js";
 import { recordRequestLog } from "./db/logger.js";
 import { requestLogs } from "./db/schema.js";
+import { checkBudget } from "./limits/budget.js";
+import { checkRateLimit } from "./limits/rate.js";
 import {
   listProviders,
   pickProviderById,
@@ -18,8 +26,8 @@ import type {
 } from "./providers/types.js";
 import { MODEL_REGISTRY } from "./routing/registry.js";
 import { resolveCandidates, type RoutingCandidate } from "./routing/policy.js";
-import { checkBudget } from "./limits/budget.js";
-import { checkRateLimit } from "./limits/rate.js";
+
+const CACHE_TTL_SEC = 86_400;
 
 const app = Fastify({
   logger: { level: config.LOG_LEVEL },
@@ -79,11 +87,13 @@ app.get("/v1/usage", async (request) => {
   const conditions = [eq(requestLogs.tenantId, tenantId)];
   if (query.from) {
     const d = new Date(query.from);
-    if (!Number.isNaN(d.getTime())) conditions.push(gte(requestLogs.createdAt, d));
+    if (!Number.isNaN(d.getTime()))
+      conditions.push(gte(requestLogs.createdAt, d));
   }
   if (query.to) {
     const d = new Date(query.to);
-    if (!Number.isNaN(d.getTime())) conditions.push(lte(requestLogs.createdAt, d));
+    if (!Number.isNaN(d.getTime()))
+      conditions.push(lte(requestLogs.createdAt, d));
   }
   const where = conditions.length > 1 ? and(...conditions) : conditions[0];
 
@@ -147,7 +157,6 @@ app.get("/v1/usage", async (request) => {
 
 app.post("/v1/chat/completions", async (request, reply) => {
   const parsed = ChatCompletionRequestSchema.safeParse(request.body);
-
   if (!parsed.success) {
     return reply.code(400).send({
       error: {
@@ -191,6 +200,12 @@ app.post("/v1/chat/completions", async (request, reply) => {
     });
   }
 
+  const directive = parseCacheDirective(
+    request.headers["x-llmgate-cache"]
+  );
+  const cacheable = shouldCache(parsed.data, directive);
+  const cacheKey = cacheable ? buildCacheKey(tenantId, parsed.data) : null;
+
   const candidates = resolveCandidates(parsed.data.model);
   if (candidates.length === 0) {
     return reply.code(400).send({
@@ -202,22 +217,71 @@ app.post("/v1/chat/completions", async (request, reply) => {
   }
 
   if (parsed.data.stream === true) {
-    return handleStreaming(request, reply, parsed.data, candidates);
+    return handleStreaming(
+      request,
+      reply,
+      parsed.data,
+      candidates,
+      cacheKey,
+      directive
+    );
   }
 
-  return handleNonStreaming(request, reply, parsed.data, candidates);
+  return handleNonStreaming(
+    request,
+    reply,
+    parsed.data,
+    candidates,
+    cacheKey,
+    directive
+  );
 });
-
 
 async function handleNonStreaming(
   request: FastifyRequest,
   reply: FastifyReply,
   req: ChatCompletionRequest,
-  candidates: RoutingCandidate[]
+  candidates: RoutingCandidate[],
+  cacheKey: string | null,
+  directive: CacheDirective
 ) {
   const startedAt = Date.now();
   const tenantId = request.tenant!.id;
   const apiKeyId = request.apiKeyId ?? null;
+
+  if (cacheKey) {
+    const cached = await cache.get(cacheKey);
+    if (cached?.type === "chat_completion") {
+      reply.header("x-llmgate-provider", cached.providerId);
+      reply.header("x-llmgate-model", cached.resolvedModel);
+      reply.header("x-llmgate-attempts", "0");
+      reply.header("x-llmgate-cache-status", "hit");
+
+      recordRequestLog({
+        tenantId,
+        apiKeyId,
+        providerId: cached.providerId,
+        requestedModel: req.model,
+        resolvedModel: cached.resolvedModel,
+        status: 200,
+        promptTokens: 0,
+        completionTokens: 0,
+        totalTokens: 0,
+        latencyMs: Date.now() - startedAt,
+        attempts: 0,
+        streamed: false,
+        cacheHit: true,
+      });
+
+      return cached.response;
+    }
+  }
+
+  reply.header(
+    "x-llmgate-cache-status",
+    cacheKey ? "miss" : directive === "skip" ? "skip" : "bypass"
+  );
+
   const attempts: Array<{ provider: string; model: string; error: string }> =
     [];
 
@@ -242,6 +306,19 @@ async function handleNonStreaming(
       reply.header("x-llmgate-model", candidate.modelId);
       reply.header("x-llmgate-attempts", String(attempts.length + 1));
 
+      if (cacheKey) {
+        await cache.set(
+          cacheKey,
+          {
+            type: "chat_completion",
+            response,
+            resolvedModel: candidate.modelId,
+            providerId: provider.id,
+          },
+          CACHE_TTL_SEC
+        );
+      }
+
       recordRequestLog({
         tenantId,
         apiKeyId,
@@ -255,6 +332,7 @@ async function handleNonStreaming(
         latencyMs: Date.now() - startedAt,
         attempts: attempts.length + 1,
         streamed: false,
+        cacheHit: false,
       });
 
       return response;
@@ -296,11 +374,52 @@ async function handleStreaming(
   request: FastifyRequest,
   reply: FastifyReply,
   req: ChatCompletionRequest,
-  candidates: RoutingCandidate[]
+  candidates: RoutingCandidate[],
+  cacheKey: string | null,
+  directive: CacheDirective
 ) {
   const startedAt = Date.now();
   const tenantId = request.tenant!.id;
   const apiKeyId = request.apiKeyId ?? null;
+
+  if (cacheKey) {
+    const cached = await cache.get(cacheKey);
+    if (cached?.type === "chat_stream") {
+      reply.hijack();
+      const res = reply.raw;
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache, no-transform",
+        Connection: "keep-alive",
+        "x-llmgate-provider": cached.providerId,
+        "x-llmgate-model": cached.resolvedModel,
+        "x-llmgate-attempts": "0",
+        "x-llmgate-cache-status": "hit",
+      });
+
+      for (const chunk of cached.chunks) {
+        res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      }
+      res.write("data: [DONE]\n\n");
+      res.end();
+
+      recordRequestLog({
+        tenantId,
+        apiKeyId,
+        providerId: cached.providerId,
+        requestedModel: req.model,
+        resolvedModel: cached.resolvedModel,
+        status: 200,
+        latencyMs: Date.now() - startedAt,
+        ttfbMs: 0,
+        attempts: 0,
+        streamed: true,
+        cacheHit: true,
+      });
+      return;
+    }
+  }
+
   const attempts: Array<{ provider: string; model: string; error: string }> =
     [];
 
@@ -348,10 +467,17 @@ async function handleStreaming(
       "x-llmgate-provider": provider.id,
       "x-llmgate-model": candidate.modelId,
       "x-llmgate-attempts": String(attempts.length + 1),
+      "x-llmgate-cache-status": cacheKey
+        ? "miss"
+        : directive === "skip"
+        ? "skip"
+        : "bypass",
     });
 
+    const recorded: ChatCompletionChunk[] = [];
     const writeChunk = (chunk: ChatCompletionChunk) => {
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
+      if (cacheKey) recorded.push(chunk);
     };
 
     let errorMessage: string | null = null;
@@ -382,17 +508,31 @@ async function handleStreaming(
 
     res.end();
 
+    if (cacheKey && !errorMessage) {
+      await cache.set(
+        cacheKey,
+        {
+          type: "chat_stream",
+          chunks: recorded,
+          resolvedModel: candidate.modelId,
+          providerId: provider.id,
+        },
+        CACHE_TTL_SEC
+      );
+    }
+
     recordRequestLog({
       tenantId,
       apiKeyId,
       providerId: provider.id,
       requestedModel: req.model,
       resolvedModel: candidate.modelId,
-      status: errorMessage ? 200 : 200,
+      status: 200,
       latencyMs: Date.now() - startedAt,
       ttfbMs,
       attempts: attempts.length + 1,
       streamed: true,
+      cacheHit: false,
       errorMessage,
     });
 

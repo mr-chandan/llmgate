@@ -63,6 +63,9 @@ export const requestLogs = sqliteTable(
     streamed: integer("streamed", { mode: "boolean" })
       .notNull()
       .default(false),
+    cacheHit: integer("cache_hit", { mode: "boolean" })
+      .notNull()
+      .default(false),
     errorMessage: text("error_message"),
     createdAt: integer("created_at", { mode: "timestamp" })
       .notNull()
