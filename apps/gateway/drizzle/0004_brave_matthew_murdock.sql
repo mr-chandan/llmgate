@@ -1,0 +1,1 @@
+ALTER TABLE `request_logs` ADD `retry_count` integer DEFAULT 0 NOT NULL;

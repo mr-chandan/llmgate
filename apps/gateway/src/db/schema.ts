@@ -60,6 +60,7 @@ export const requestLogs = sqliteTable(
     latencyMs: integer("latency_ms").notNull().default(0),
     ttfbMs: integer("ttfb_ms"),
     attempts: integer("attempts").notNull().default(1),
+    retryCount: integer("retry_count").notNull().default(0),
     streamed: integer("streamed", { mode: "boolean" })
       .notNull()
       .default(false),

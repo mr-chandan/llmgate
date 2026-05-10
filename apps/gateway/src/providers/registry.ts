@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { chaosProvider } from "./chaos.js";
 import { geminiProvider } from "./gemini.js";
 import { createGroqProvider } from "./groq.js";
 import type { Provider } from "./types.js";
@@ -7,6 +8,10 @@ const providers: Provider[] = [geminiProvider];
 
 if (config.GROQ_API_KEY) {
   providers.push(createGroqProvider(config.GROQ_API_KEY));
+}
+
+if (config.ENABLE_CHAOS) {
+  providers.push(chaosProvider);
 }
 
 export function pickProvider(model: string): Provider | undefined {

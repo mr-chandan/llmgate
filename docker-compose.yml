@@ -1,0 +1,23 @@
+services:
+  gateway:
+    build: .
+    image: llmgate:dev
+    ports:
+      - "4000:4000"
+    env_file:
+      - apps/gateway/.env
+    environment:
+      - HOST=0.0.0.0
+      - PORT=4000
+      - DATABASE_URL=/data/llmgate.sqlite
+    volumes:
+      - llmgate-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  llmgate-data:

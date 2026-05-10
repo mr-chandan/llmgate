@@ -5,7 +5,9 @@ import type {
   ChatCompletionChunk,
   ChatCompletionRequest,
   ChatCompletionResponse,
+  ChatCompletionUsage,
   Provider,
+  ProviderCallContext,
 } from "./types.js";
 
 const client = new GoogleGenAI({ apiKey: config.GEMINI_API_KEY });
@@ -46,6 +48,7 @@ function mapFinishReason(
   }
 }
 
+
 export const geminiProvider: Provider = {
   id: "gemini",
 
@@ -53,7 +56,7 @@ export const geminiProvider: Provider = {
     return model.startsWith("gemini-");
   },
 
-  async chat(req) {
+  async chat(req, ctx) {
     const { systemInstruction, contents } = toGeminiContents(req.messages);
 
     const response = await client.models.generateContent({
@@ -63,6 +66,7 @@ export const geminiProvider: Provider = {
         systemInstruction,
         temperature: req.temperature,
         maxOutputTokens: req.max_tokens,
+        abortSignal: ctx?.signal,
       },
     });
 
@@ -92,7 +96,10 @@ export const geminiProvider: Provider = {
     };
   },
 
-  async *chatStream(req): AsyncIterable<ChatCompletionChunk> {
+  async *chatStream(
+    req,
+    ctx
+  ): AsyncIterable<ChatCompletionChunk> {
     const { systemInstruction, contents } = toGeminiContents(req.messages);
     const id = `chatcmpl-${randomUUID()}`;
     const created = Math.floor(Date.now() / 1000);
@@ -104,17 +111,31 @@ export const geminiProvider: Provider = {
         systemInstruction,
         temperature: req.temperature,
         maxOutputTokens: req.max_tokens,
+        abortSignal: ctx?.signal,
       },
     });
 
     let firstChunk = true;
     let finishReason: string | null = null;
+    let lastUsage: ChatCompletionUsage | undefined;
 
     for await (const chunk of stream) {
+      if (ctx?.signal?.aborted) {
+        throw ctx.signal.reason ?? new Error("aborted");
+      }
+
       const text = chunk.text ?? "";
       const candidate = chunk.candidates?.[0];
       if (candidate?.finishReason) {
         finishReason = mapFinishReason(candidate.finishReason);
+      }
+      const usage = chunk.usageMetadata;
+      if (usage) {
+        lastUsage = {
+          prompt_tokens: usage.promptTokenCount ?? 0,
+          completion_tokens: usage.candidatesTokenCount ?? 0,
+          total_tokens: usage.totalTokenCount ?? 0,
+        };
       }
 
       if (text) {
@@ -149,6 +170,9 @@ export const geminiProvider: Provider = {
           finish_reason: finishReason ?? "stop",
         },
       ],
+      usage: lastUsage,
     };
   },
 };
+
+export type { ProviderCallContext };

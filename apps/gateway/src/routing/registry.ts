@@ -43,6 +43,24 @@ export const MODEL_REGISTRY: ModelInfo[] = [
     contextWindow: 131_072,
     classes: ["balanced", "fast"],
   },
+
+  // Chaos (failure injection — only when ENABLE_CHAOS=true)
+  {
+    id: "chaos-ok",
+    providerId: "chaos",
+    inputUsdPerMTokens: 0,
+    outputUsdPerMTokens: 0,
+    contextWindow: 0,
+    classes: [],
+  },
+  {
+    id: "chaos-fail",
+    providerId: "chaos",
+    inputUsdPerMTokens: 0,
+    outputUsdPerMTokens: 0,
+    contextWindow: 0,
+    classes: [],
+  },
 ];
 
 export function findModel(id: string): ModelInfo | undefined {

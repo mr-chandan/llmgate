@@ -4,6 +4,7 @@ import type {
   ChatCompletionChunk,
   ChatCompletionRequest,
   ChatCompletionResponse,
+  ChatCompletionUsage,
   Provider,
 } from "./types.js";
 
@@ -44,14 +45,17 @@ export function createOpenAICompatibleProvider(
     id: cfg.id,
     supports: cfg.supports,
 
-    async chat(req: ChatCompletionRequest): Promise<ChatCompletionResponse> {
-      const response = await client.chat.completions.create({
-        model: req.model,
-        messages: req.messages,
-        temperature: req.temperature,
-        max_tokens: req.max_tokens,
-        stream: false,
-      });
+    async chat(req, ctx) {
+      const response = await client.chat.completions.create(
+        {
+          model: req.model,
+          messages: req.messages,
+          temperature: req.temperature,
+          max_tokens: req.max_tokens,
+          stream: false,
+        },
+        { signal: ctx?.signal }
+      );
 
       const choice = response.choices[0];
 
@@ -78,20 +82,37 @@ export function createOpenAICompatibleProvider(
       };
     },
 
-    async *chatStream(req): AsyncIterable<ChatCompletionChunk> {
+    async *chatStream(req, ctx): AsyncIterable<ChatCompletionChunk> {
       const fallbackId = `chatcmpl-${randomUUID()}`;
       const fallbackCreated = Math.floor(Date.now() / 1000);
 
-      const stream = await client.chat.completions.create({
-        model: req.model,
-        messages: req.messages,
-        temperature: req.temperature,
-        max_tokens: req.max_tokens,
-        stream: true,
-      });
+      const stream = await client.chat.completions.create(
+        {
+          model: req.model,
+          messages: req.messages,
+          temperature: req.temperature,
+          max_tokens: req.max_tokens,
+          stream: true,
+          stream_options: { include_usage: true },
+        },
+        { signal: ctx?.signal }
+      );
 
       for await (const chunk of stream) {
-        yield {
+        if (ctx?.signal?.aborted) {
+          throw ctx.signal.reason ?? new Error("aborted");
+        }
+
+        let usage: ChatCompletionUsage | undefined;
+        if (chunk.usage) {
+          usage = {
+            prompt_tokens: chunk.usage.prompt_tokens ?? 0,
+            completion_tokens: chunk.usage.completion_tokens ?? 0,
+            total_tokens: chunk.usage.total_tokens ?? 0,
+          };
+        }
+
+        const out: ChatCompletionChunk = {
           id: chunk.id ?? fallbackId,
           object: "chat.completion.chunk",
           created: chunk.created ?? fallbackCreated,
@@ -107,6 +128,8 @@ export function createOpenAICompatibleProvider(
             finish_reason: c.finish_reason ?? null,
           })),
         };
+        if (usage) out.usage = usage;
+        yield out;
       }
     },
   };

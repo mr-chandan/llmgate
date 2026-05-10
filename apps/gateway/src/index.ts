@@ -1,6 +1,7 @@
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { and, count, eq, gte, lte, sum } from "drizzle-orm";
 import { z } from "zod";
+import { applyAdmin } from "./admin.js";
 import { applyAuth } from "./auth.js";
 import { cache } from "./cache/memory.js";
 import {
@@ -13,8 +14,22 @@ import { config } from "./config.js";
 import { db, runMigrations } from "./db/client.js";
 import { recordRequestLog } from "./db/logger.js";
 import { requestLogs } from "./db/schema.js";
+import { applyAllowlists } from "./limits/allowlist.js";
 import { checkBudget } from "./limits/budget.js";
-import { checkRateLimit } from "./limits/rate.js";
+import {
+  checkRateLimit,
+  checkTpmPreflight,
+  recordTpm,
+} from "./limits/rate.js";
+import {
+  budgetExceededTotal,
+  cacheOps,
+  chatErrors,
+  circuitOpenGauge,
+  httpRequests,
+  rateLimitedTotal,
+  registry as metricsRegistry,
+} from "./metrics.js";
 import {
   listProviders,
   pickProviderById,
@@ -22,8 +37,13 @@ import {
 import type {
   ChatCompletionChunk,
   ChatCompletionRequest,
+  ChatCompletionUsage,
   Provider,
 } from "./providers/types.js";
+import { applyRequestId } from "./request-id.js";
+import { circuitBreaker, circuitKey } from "./resilience/circuit.js";
+import { retry } from "./resilience/retry.js";
+import { withTimeout } from "./resilience/timeouts.js";
 import { MODEL_REGISTRY } from "./routing/registry.js";
 import { resolveCandidates, type RoutingCandidate } from "./routing/policy.js";
 
@@ -33,7 +53,20 @@ const app = Fastify({
   logger: { level: config.LOG_LEVEL },
 });
 
+applyRequestId(app);
 applyAuth(app);
+applyAdmin(app);
+
+// Light HTTP-level metrics for every request.
+app.addHook("onResponse", async (request, reply) => {
+  const route = request.routeOptions?.url ?? request.url.split("?")[0];
+  httpRequests.inc({
+    route,
+    method: request.method,
+    status: String(reply.statusCode),
+  });
+  circuitOpenGauge.set(circuitBreaker.countOpen());
+});
 
 const ChatCompletionRequestSchema = z.object({
   model: z.string().min(1),
@@ -59,6 +92,11 @@ app.get("/", async () => ({
 }));
 
 app.get("/healthz", async () => ({ ok: true }));
+
+app.get("/metrics", async (_request, reply) => {
+  reply.header("Content-Type", metricsRegistry.contentType);
+  return metricsRegistry.metrics();
+});
 
 app.get("/v1/models", async () => {
   const activeProviders = new Set(listProviders());
@@ -169,8 +207,10 @@ app.post("/v1/chat/completions", async (request, reply) => {
 
   const tenantId = request.tenant!.id;
 
+  // RPM rate limit (request count per minute)
   const rate = checkRateLimit(tenantId);
   if (!rate.ok) {
+    rateLimitedTotal.inc({ tenant: tenantId, kind: "rpm" });
     reply.header("Retry-After", String(rate.retryAfterSec));
     reply.header("x-ratelimit-limit", String(rate.limit));
     reply.header("x-ratelimit-remaining", "0");
@@ -187,8 +227,27 @@ app.post("/v1/chat/completions", async (request, reply) => {
     reply.header("x-ratelimit-remaining", String(rate.remaining));
   }
 
+  // TPM pre-flight: reject if tenant already exceeded their token-per-minute
+  // limit from previous calls in this window.
+  const tpm = checkTpmPreflight(tenantId);
+  if (!tpm.ok) {
+    rateLimitedTotal.inc({ tenant: tenantId, kind: "tpm" });
+    reply.header("Retry-After", String(tpm.retryAfterSec));
+    return reply.code(429).send({
+      error: {
+        type: "rate_limit_exceeded",
+        message: `Token-per-minute limit exceeded: ${tpm.limit} tpm`,
+        retry_after_seconds: tpm.retryAfterSec,
+      },
+    });
+  }
+
   const budget = checkBudget(tenantId);
   if (!budget.ok) {
+    budgetExceededTotal.inc({
+      tenant: tenantId,
+      period: budget.period ?? "unknown",
+    });
     return reply.code(402).send({
       error: {
         type: "budget_exceeded",
@@ -206,7 +265,7 @@ app.post("/v1/chat/completions", async (request, reply) => {
   const cacheable = shouldCache(parsed.data, directive);
   const cacheKey = cacheable ? buildCacheKey(tenantId, parsed.data) : null;
 
-  const candidates = resolveCandidates(parsed.data.model);
+  let candidates = resolveCandidates(parsed.data.model);
   if (candidates.length === 0) {
     return reply.code(400).send({
       error: {
@@ -215,6 +274,23 @@ app.post("/v1/chat/completions", async (request, reply) => {
       },
     });
   }
+
+  // Allowlist filter
+  const filtered = applyAllowlists(tenantId, candidates);
+  if (filtered.allowed.length === 0) {
+    return reply.code(403).send({
+      error: {
+        type: "allowlist_violation",
+        message: "All candidates blocked by tenant allowlist",
+        blocked: filtered.blocked.map((b) => ({
+          provider: b.candidate.providerId,
+          model: b.candidate.modelId,
+          reason: b.reason,
+        })),
+      },
+    });
+  }
+  candidates = filtered.allowed;
 
   if (parsed.data.stream === true) {
     return handleStreaming(
@@ -237,6 +313,13 @@ app.post("/v1/chat/completions", async (request, reply) => {
   );
 });
 
+interface AttemptRecord {
+  provider: string;
+  model: string;
+  error: string;
+  retries?: number;
+}
+
 async function handleNonStreaming(
   request: FastifyRequest,
   reply: FastifyReply,
@@ -248,33 +331,37 @@ async function handleNonStreaming(
   const startedAt = Date.now();
   const tenantId = request.tenant!.id;
   const apiKeyId = request.apiKeyId ?? null;
+  const requestId = request.requestId;
 
   if (cacheKey) {
     const cached = await cache.get(cacheKey);
     if (cached?.type === "chat_completion") {
+      cacheOps.inc({ op: "hit" });
       reply.header("x-llmgate-provider", cached.providerId);
       reply.header("x-llmgate-model", cached.resolvedModel);
       reply.header("x-llmgate-attempts", "0");
       reply.header("x-llmgate-cache-status", "hit");
 
       recordRequestLog({
+        id: requestId,
         tenantId,
         apiKeyId,
         providerId: cached.providerId,
         requestedModel: req.model,
         resolvedModel: cached.resolvedModel,
         status: 200,
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
         latencyMs: Date.now() - startedAt,
         attempts: 0,
+        retryCount: 0,
         streamed: false,
         cacheHit: true,
       });
 
       return cached.response;
     }
+    cacheOps.inc({ op: "miss" });
+  } else {
+    cacheOps.inc({ op: directive === "skip" ? "skip" : "bypass" });
   }
 
   reply.header(
@@ -282,8 +369,8 @@ async function handleNonStreaming(
     cacheKey ? "miss" : directive === "skip" ? "skip" : "bypass"
   );
 
-  const attempts: Array<{ provider: string; model: string; error: string }> =
-    [];
+  const attempts: AttemptRecord[] = [];
+  let totalRetries = 0;
 
   for (const candidate of candidates) {
     const provider = pickProviderById(candidate.providerId);
@@ -296,48 +383,90 @@ async function handleNonStreaming(
       continue;
     }
 
-    try {
-      const response = await provider.chat({
-        ...req,
+    const cKey = circuitKey(provider.id, candidate.modelId);
+    if (!circuitBreaker.tryAcquire(cKey)) {
+      attempts.push({
+        provider: provider.id,
         model: candidate.modelId,
+        error: "circuit_open",
       });
+      reply.header("x-llmgate-circuit-skipped", cKey);
+      continue;
+    }
+
+    try {
+      const result = await retry(
+        async () => {
+          const t = withTimeout(config.PROVIDER_TIMEOUT_MS);
+          try {
+            return await provider.chat(
+              { ...req, model: candidate.modelId },
+              { signal: t.signal }
+            );
+          } finally {
+            t.cancel();
+          }
+        },
+        {
+          maxAttempts: config.PROVIDER_MAX_RETRIES,
+          baseMs: config.PROVIDER_RETRY_BASE_MS,
+          maxMs: config.PROVIDER_RETRY_MAX_MS,
+        }
+      );
+
+      circuitBreaker.recordSuccess(cKey);
+      const retries = result.attempts - 1;
+      totalRetries += retries;
 
       reply.header("x-llmgate-provider", provider.id);
       reply.header("x-llmgate-model", candidate.modelId);
       reply.header("x-llmgate-attempts", String(attempts.length + 1));
+      reply.header("x-llmgate-retries", String(retries));
 
       if (cacheKey) {
         await cache.set(
           cacheKey,
           {
             type: "chat_completion",
-            response,
+            response: result.value,
             resolvedModel: candidate.modelId,
             providerId: provider.id,
           },
           CACHE_TTL_SEC
         );
+        cacheOps.inc({ op: "set" });
       }
 
+      const usage = result.value.usage;
+      recordTpm(tenantId, usage.total_tokens);
+
       recordRequestLog({
+        id: requestId,
         tenantId,
         apiKeyId,
         providerId: provider.id,
         requestedModel: req.model,
         resolvedModel: candidate.modelId,
         status: 200,
-        promptTokens: response.usage.prompt_tokens,
-        completionTokens: response.usage.completion_tokens,
-        totalTokens: response.usage.total_tokens,
+        promptTokens: usage.prompt_tokens,
+        completionTokens: usage.completion_tokens,
+        totalTokens: usage.total_tokens,
         latencyMs: Date.now() - startedAt,
         attempts: attempts.length + 1,
+        retryCount: totalRetries,
         streamed: false,
         cacheHit: false,
       });
 
-      return response;
+      return result.value;
     } catch (err) {
       const message = err instanceof Error ? err.message : "unknown error";
+      circuitBreaker.recordFailure(cKey);
+      chatErrors.inc({
+        provider: provider.id,
+        model: candidate.modelId,
+        error_type: classifyError(err),
+      });
       request.log.warn(
         { provider: provider.id, model: candidate.modelId, err: message },
         "Provider call failed; trying next candidate"
@@ -351,12 +480,14 @@ async function handleNonStreaming(
   }
 
   recordRequestLog({
+    id: requestId,
     tenantId,
     apiKeyId,
     requestedModel: req.model,
     status: 502,
     latencyMs: Date.now() - startedAt,
     attempts: attempts.length,
+    retryCount: totalRetries,
     streamed: false,
     errorMessage: "all providers failed",
   });
@@ -381,16 +512,19 @@ async function handleStreaming(
   const startedAt = Date.now();
   const tenantId = request.tenant!.id;
   const apiKeyId = request.apiKeyId ?? null;
+  const requestId = request.requestId;
 
   if (cacheKey) {
     const cached = await cache.get(cacheKey);
     if (cached?.type === "chat_stream") {
+      cacheOps.inc({ op: "hit" });
       reply.hijack();
       const res = reply.raw;
       res.writeHead(200, {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache, no-transform",
         Connection: "keep-alive",
+        "x-request-id": requestId,
         "x-llmgate-provider": cached.providerId,
         "x-llmgate-model": cached.resolvedModel,
         "x-llmgate-attempts": "0",
@@ -404,6 +538,7 @@ async function handleStreaming(
       res.end();
 
       recordRequestLog({
+        id: requestId,
         tenantId,
         apiKeyId,
         providerId: cached.providerId,
@@ -413,15 +548,18 @@ async function handleStreaming(
         latencyMs: Date.now() - startedAt,
         ttfbMs: 0,
         attempts: 0,
+        retryCount: 0,
         streamed: true,
         cacheHit: true,
       });
       return;
     }
+    cacheOps.inc({ op: "miss" });
+  } else {
+    cacheOps.inc({ op: directive === "skip" ? "skip" : "bypass" });
   }
 
-  const attempts: Array<{ provider: string; model: string; error: string }> =
-    [];
+  const attempts: AttemptRecord[] = [];
 
   for (const candidate of candidates) {
     const provider = pickProviderById(candidate.providerId);
@@ -434,29 +572,47 @@ async function handleStreaming(
       continue;
     }
 
-    const probeResult = await probeStream(provider, {
-      ...req,
-      model: candidate.modelId,
-    });
+    const cKey = circuitKey(provider.id, candidate.modelId);
+    if (!circuitBreaker.tryAcquire(cKey)) {
+      attempts.push({
+        provider: provider.id,
+        model: candidate.modelId,
+        error: "circuit_open",
+      });
+      continue;
+    }
 
-    if ("error" in probeResult) {
+    const probe = await probeStream(
+      provider,
+      { ...req, model: candidate.modelId },
+      config.PROVIDER_TIMEOUT_MS
+    );
+
+    if ("error" in probe) {
+      circuitBreaker.recordFailure(cKey);
+      chatErrors.inc({
+        provider: provider.id,
+        model: candidate.modelId,
+        error_type: "stream_probe_failed",
+      });
       request.log.warn(
         {
           provider: provider.id,
           model: candidate.modelId,
-          err: probeResult.error,
+          err: probe.error,
         },
         "Stream failed before first chunk; trying next candidate"
       );
       attempts.push({
         provider: provider.id,
         model: candidate.modelId,
-        error: probeResult.error,
+        error: probe.error,
       });
       continue;
     }
 
     const ttfbMs = Date.now() - startedAt;
+    let succeeded = true;
 
     reply.hijack();
     const res = reply.raw;
@@ -464,6 +620,7 @@ async function handleStreaming(
       "Content-Type": "text/event-stream",
       "Cache-Control": "no-cache, no-transform",
       Connection: "keep-alive",
+      "x-request-id": requestId,
       "x-llmgate-provider": provider.id,
       "x-llmgate-model": candidate.modelId,
       "x-llmgate-attempts": String(attempts.length + 1),
@@ -475,7 +632,10 @@ async function handleStreaming(
     });
 
     const recorded: ChatCompletionChunk[] = [];
+    let usage: ChatCompletionUsage | undefined;
+
     const writeChunk = (chunk: ChatCompletionChunk) => {
+      if (chunk.usage) usage = chunk.usage;
       res.write(`data: ${JSON.stringify(chunk)}\n\n`);
       if (cacheKey) recorded.push(chunk);
     };
@@ -483,19 +643,25 @@ async function handleStreaming(
     let errorMessage: string | null = null;
 
     try {
-      writeChunk(probeResult.first);
-      for await (const chunk of probeResult.rest) {
+      writeChunk(probe.first);
+      for await (const chunk of probe.rest) {
         writeChunk(chunk);
       }
       res.write("data: [DONE]\n\n");
     } catch (err) {
+      succeeded = false;
       errorMessage = err instanceof Error ? err.message : "unknown error";
+      chatErrors.inc({
+        provider: provider.id,
+        model: candidate.modelId,
+        error_type: "stream_mid_flight",
+      });
       request.log.error(
         { provider: provider.id, model: candidate.modelId, err: errorMessage },
         "Stream errored mid-flight"
       );
       writeChunk({
-        id: probeResult.first.id,
+        id: probe.first.id,
         object: "chat.completion.chunk",
         created: Math.floor(Date.now() / 1000),
         model: candidate.modelId,
@@ -508,7 +674,10 @@ async function handleStreaming(
 
     res.end();
 
-    if (cacheKey && !errorMessage) {
+    if (succeeded) circuitBreaker.recordSuccess(cKey);
+    else circuitBreaker.recordFailure(cKey);
+
+    if (cacheKey && succeeded) {
       await cache.set(
         cacheKey,
         {
@@ -519,18 +688,26 @@ async function handleStreaming(
         },
         CACHE_TTL_SEC
       );
+      cacheOps.inc({ op: "set" });
     }
 
+    if (usage) recordTpm(tenantId, usage.total_tokens);
+
     recordRequestLog({
+      id: requestId,
       tenantId,
       apiKeyId,
       providerId: provider.id,
       requestedModel: req.model,
       resolvedModel: candidate.modelId,
       status: 200,
+      promptTokens: usage?.prompt_tokens,
+      completionTokens: usage?.completion_tokens,
+      totalTokens: usage?.total_tokens,
       latencyMs: Date.now() - startedAt,
       ttfbMs,
       attempts: attempts.length + 1,
+      retryCount: 0,
       streamed: true,
       cacheHit: false,
       errorMessage,
@@ -540,12 +717,14 @@ async function handleStreaming(
   }
 
   recordRequestLog({
+    id: requestId,
     tenantId,
     apiKeyId,
     requestedModel: req.model,
     status: 502,
     latencyMs: Date.now() - startedAt,
     attempts: attempts.length,
+    retryCount: 0,
     streamed: true,
     errorMessage: "all streaming candidates failed before first chunk",
   });
@@ -561,19 +740,25 @@ async function handleStreaming(
 
 async function probeStream(
   provider: Provider,
-  req: ChatCompletionRequest
+  req: ChatCompletionRequest,
+  timeoutMs: number
 ): Promise<
   | { first: ChatCompletionChunk; rest: AsyncIterable<ChatCompletionChunk> }
   | { error: string }
 > {
+  const t = withTimeout(timeoutMs);
   try {
-    const iterable = provider.chatStream(req);
+    const iterable = provider.chatStream(req, { signal: t.signal });
     const iterator = iterable[Symbol.asyncIterator]();
     const firstResult = await iterator.next();
 
     if (firstResult.done || !firstResult.value) {
+      t.cancel();
       return { error: "stream ended with no chunks" };
     }
+
+    // The stream lives past this function; cancel only the first-byte timer.
+    t.cancel();
 
     const rest: AsyncIterable<ChatCompletionChunk> = {
       [Symbol.asyncIterator]() {
@@ -587,10 +772,25 @@ async function probeStream(
 
     return { first: firstResult.value, rest };
   } catch (err) {
+    t.cancel();
     return {
       error: err instanceof Error ? err.message : "unknown error",
     };
   }
+}
+
+function classifyError(err: unknown): string {
+  if (!(err instanceof Error)) return "unknown";
+  if (err.name === "TimeoutError") return "timeout";
+  const status = (err as { status?: unknown }).status;
+  if (typeof status === "number") {
+    if (status === 429) return "rate_limited";
+    if (status >= 500) return "5xx";
+    if (status >= 400) return "4xx";
+  }
+  if (/network|fetch failed|econnreset|econnrefused/i.test(err.message ?? ""))
+    return "network";
+  return "other";
 }
 
 try {

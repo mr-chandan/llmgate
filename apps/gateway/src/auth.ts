@@ -11,11 +11,14 @@ declare module "fastify" {
   }
 }
 
-const PUBLIC_PATHS = new Set(["/", "/healthz"]);
+const PUBLIC_PATHS = new Set(["/", "/healthz", "/metrics"]);
 
 function isPublic(path: string): boolean {
   const pathOnly = path.split("?")[0] ?? path;
-  return PUBLIC_PATHS.has(pathOnly);
+  if (PUBLIC_PATHS.has(pathOnly)) return true;
+  // /admin/* is gated by its own X-Admin-Key check, not bearer auth.
+  if (pathOnly.startsWith("/admin/")) return true;
+  return false;
 }
 
 function unauthorized(reply: FastifyReply, message: string) {
